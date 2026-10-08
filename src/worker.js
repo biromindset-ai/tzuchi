@@ -3,9 +3,9 @@
  * Pengecekan dilakukan di SERVER, jadi halaman dasbor tidak terkirim sebelum login benar.
  *
  * Variabel (Settings → Variables and Secrets, tipe RUNTIME):
- *   ALLOWED_EMAILS  daftar email dipisah koma (di wrangler.jsonc)
- *   APP_PASSWORD    (secret) password bersama, disarankan ≥ 16 karakter
+ *   USER_PASSWORDS  (secret) JSON {"email1":"password1","email2":"password2",...} → password per email
  *   SESSION_SECRET  (secret) teks acak ≥ 32 karakter
+ * Cadangan bila USER_PASSWORDS belum diisi: ALLOWED_EMAILS (var) + APP_PASSWORD (secret) = satu password bersama.
  */
 const SESSION_HOURS = 12;
 const enc = new TextEncoder();
@@ -58,21 +58,38 @@ ${error ? `<div class="e">${esc(error)}</div>` : ''}
   return new Response(html, {status, headers:h});
 }
 
+// Peta email → password. Sumber utama USER_PASSWORDS; cadangan: ALLOWED_EMAILS + APP_PASSWORD.
+function getUsers(env){
+  const m = new Map();
+  try{
+    const o = JSON.parse(env.USER_PASSWORDS || '');
+    for(const [k, v] of Object.entries(o)) if(typeof v === 'string' && v) m.set(k.trim().toLowerCase(), v);
+    if(m.size) return m;
+  }catch{}
+  if(env.APP_PASSWORD)
+    (env.ALLOWED_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean).forEach(e => m.set(e, env.APP_PASSWORD));
+  return m;
+}
+// "versi password": sesi otomatis tidak berlaku bila password email tsb diganti/dihapus
+const pwVersion = async (email, pw) =>
+  b64u(await crypto.subtle.digest('SHA-256', enc.encode(email + ':' + pw))).slice(0, 16);
+
 export default {
   async fetch(request, env){
     const url = new URL(request.url);
-    const allowed = (env.ALLOWED_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const users = getUsers(env);
 
     if(url.pathname === '/auth/login' && request.method === 'POST'){
       const f = await request.formData();
       const email = String(f.get('email') || '').trim().toLowerCase(), pw = String(f.get('password') || '');
-      const okEmail = allowed.includes(email);
-      const okPw = await sameSecret(pw, env.APP_PASSWORD || '');
-      if(!(okEmail && okPw && env.APP_PASSWORD)){
+      const expected = users.get(email);
+      // selalu lakukan perbandingan agar waktu respons tidak membocorkan email mana yang terdaftar
+      const same = await sameSecret(pw, expected ?? b64u(crypto.getRandomValues(new Uint8Array(16))));
+      if(!(expected !== undefined && same)){
         await new Promise(r => setTimeout(r, 1000)); // memperlambat tebak-tebakan
         return loginPage('Email atau password salah.', 401);
       }
-      const sid = await sign({email, exp: Math.floor(Date.now()/1000) + SESSION_HOURS*3600}, env.SESSION_SECRET);
+      const sid = await sign({email, pv: await pwVersion(email, expected), exp: Math.floor(Date.now()/1000) + SESSION_HOURS*3600}, env.SESSION_SECRET);
       const h = new Headers({Location:'/', 'Cache-Control':'no-store'});
       h.append('Set-Cookie', cookie('sid', sid, SESSION_HOURS*3600));
       return new Response(null, {status:303, headers:h});
@@ -80,7 +97,8 @@ export default {
     if(url.pathname === '/auth/logout') return loginPage('Anda sudah keluar.', 200, [cookie('sid','',0)]);
 
     const sess = await verify(getCookie(request,'sid'), env.SESSION_SECRET);
-    if(!sess || !allowed.includes(String(sess.email).toLowerCase())) return loginPage();
+    const cur = sess && users.get(String(sess.email).toLowerCase());
+    if(!sess || cur === undefined || sess.pv !== await pwVersion(String(sess.email).toLowerCase(), cur)) return loginPage();
 
     const res = await env.ASSETS.fetch(request);
     const h = new Headers(res.headers);
